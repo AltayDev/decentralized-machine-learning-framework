@@ -1,0 +1,9 @@
+torch
+torchvision
+numpy
+flask
+requests
+pyyaml
+tqdm
+psutil
+matplotlib

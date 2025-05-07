@@ -1,0 +1,11 @@
+/temp
+/temp/*
+/models
+/models/*
+/data
+/data/*
+/logs
+/logs/*
+/results
+/results/*
+
