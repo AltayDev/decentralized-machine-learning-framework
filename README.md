@@ -52,7 +52,7 @@ This system uses a decentralized approach instead of a classic client-server arc
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone [<repository-url>](https://github.com/AltayDev/decentralized-machine-learning-framework.git)
 cd decentralized-machine-learning-framework
 
 # Install dependencies
