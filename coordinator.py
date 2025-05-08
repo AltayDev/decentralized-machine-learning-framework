@@ -15,9 +15,18 @@ import numpy as np
 from flask import Flask, request, jsonify, send_file
 from werkzeug.serving import run_simple
 
-from model import get_model
-from utils import serialize_model, deserialize_model, federated_averaging
+from model_registry import model_registry
+from utils import serialize_model, deserialize_model, federated_averaging, get_system_info
 import config
+
+# Global state
+current_model_name = "t5-small"  # Default model name
+nodes = {}  # Stores information about connected nodes
+node_models = {}  # Stores model updates from nodes
+global_model = None  # The global model being trained
+training_round = 0  # Current training round
+training_in_progress = False  # Flag indicating if training is in progress
+lock = threading.RLock()  # Lock for thread safety
 
 # Configure logging
 logging.basicConfig(
@@ -33,196 +42,146 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 
-# Global state
-nodes = {}  # Stores information about connected nodes
-node_models = {}  # Stores model updates from nodes
-global_model = None  # The global model being trained
-training_round = 0  # Current training round
-training_in_progress = False  # Flag indicating if training is in progress
-lock = threading.RLock()  # Lock for thread safety
-
-def initialize_global_model():
-    """Initialize the global model."""
-    global global_model
-    logger.info("Initializing global model")
-    global_model = get_model()
-    return global_model
-
-@app.route('/api/register', methods=['POST'])
-def register_node():
-    """Register a new node to the network."""
-    data = request.json
-    node_id = str(uuid.uuid4())
+class Coordinator:
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.nodes: Dict[str, Dict[str, Any]] = {}
+        self.global_model = None
+        self.current_round = 0
+        self._initialize_global_model()
     
-    with lock:
-        nodes[node_id] = {
-            "id": node_id,
-            "ip": request.remote_addr,
+    def _initialize_global_model(self):
+        """Initialize the global model."""
+        model_info = model_registry.get_model(self.model_name)
+        self.global_model = model_info["model_class"](**model_info["config"])
+        logger.info(f"Initialized global model: {self.model_name}")
+    
+    def register_node(self, node_id: str, system_info: Dict[str, Any]) -> bool:
+        """Register a new node with the coordinator."""
+        if node_id in self.nodes:
+            logger.warning(f"Node {node_id} already registered")
+            return False
+        
+        self.nodes[node_id] = {
+            "system_info": system_info,
             "last_heartbeat": time.time(),
-            "system_info": data.get("system_info", {}),
-            "status": "registered"
+            "model_state": None
         }
+        logger.info(f"Registered node: {node_id}")
+        return True
     
-    logger.info(f"New node registered: {node_id} from {request.remote_addr}")
-    return jsonify({
-        "node_id": node_id,
-        "message": "Node registered successfully",
-        "coordinator_status": get_coordinator_status()
-    })
+    def update_node_heartbeat(self, node_id: str, system_info: Dict[str, Any]) -> bool:
+        """Update node heartbeat and system info."""
+        if node_id not in self.nodes:
+            logger.warning(f"Node {node_id} not registered")
+            return False
+        
+        self.nodes[node_id]["last_heartbeat"] = time.time()
+        self.nodes[node_id]["system_info"] = system_info
+        return True
+    
+    def update_node_model(self, node_id: str, model_state: Dict[str, torch.Tensor]) -> bool:
+        """Update node's model state."""
+        if node_id not in self.nodes:
+            logger.warning(f"Node {node_id} not registered")
+            return False
+        
+        self.nodes[node_id]["model_state"] = model_state
+        return True
+    
+    def aggregate_models(self) -> bool:
+        """Aggregate models from all nodes using federated averaging."""
+        active_nodes = [
+            node for node_id, node in self.nodes.items()
+            if time.time() - node["last_heartbeat"] < config.NODE_TIMEOUT
+            and node["model_state"] is not None
+        ]
+        
+        if not active_nodes:
+            logger.warning("No active nodes with model updates")
+            return False
+        
+        model_states = [node["model_state"] for node in active_nodes]
+        self.global_model.load_state_dict(federated_averaging(model_states))
+        self.current_round += 1
+        logger.info(f"Aggregated models from {len(active_nodes)} nodes in round {self.current_round}")
+        return True
 
-@app.route('/api/heartbeat', methods=['POST'])
-def heartbeat():
-    """Process heartbeat from a node."""
+# Create global coordinator instance
+coordinator = None
+
+@app.route("/register", methods=["POST"])
+def register():
     data = request.json
     node_id = data.get("node_id")
-    system_info = data.get("system_info", {})
+    system_info = data.get("system_info")
+    model_name = data.get("model_name")
     
-    if not node_id:
-        return jsonify({"error": "Missing node ID"}), 400
+    if not all([node_id, system_info, model_name]):
+        return jsonify({"error": "Missing required fields"}), 400
     
-    with lock:
-        if node_id not in nodes:
-            logger.warning(f"Heartbeat from unknown node ID: {node_id}, re-registering...")
-            # Auto-register if node_id not found
-            new_node = {
-                "id": node_id,
-                "ip": request.remote_addr,
-                "last_heartbeat": time.time(),
-                "system_info": system_info,
-                "status": "re-registered"
-            }
-            nodes[node_id] = new_node
-            logger.info(f"Auto-registered node: {node_id} from {request.remote_addr}")
-        else:
-            # Update existing node
-            nodes[node_id]["last_heartbeat"] = time.time()
-            nodes[node_id]["system_info"] = system_info
+    global coordinator
+    if coordinator is None:
+        coordinator = Coordinator(model_name)
     
-    return jsonify({"message": "Heartbeat received", "status": get_coordinator_status()})
+    success = coordinator.register_node(node_id, system_info)
+    if success:
+        return jsonify({"node_id": node_id}), 200
+    else:
+        return jsonify({"error": "Registration failed"}), 400
 
-@app.route('/api/get_model', methods=['GET'])
-def get_global_model():
-    """Return the current global model to a node."""
-    node_id = request.args.get("node_id")
+@app.route("/heartbeat", methods=["POST"])
+def heartbeat():
+    data = request.json
+    node_id = data.get("node_id")
+    system_info = data.get("system_info")
+    model_name = data.get("model_name")
     
-    if not node_id:
-        return jsonify({"error": "Missing node ID"}), 400
+    if not all([node_id, system_info, model_name]):
+        return jsonify({"error": "Missing required fields"}), 400
     
-    with lock:
-        if node_id not in nodes:
-            logger.warning(f"Model request from unknown node ID: {node_id}, auto-registering...")
-            # Auto-register if node_id not found
-            new_node = {
-                "id": node_id,
-                "ip": request.remote_addr,
-                "last_heartbeat": time.time(),
-                "system_info": {},
-                "status": "auto-registered"
-            }
-            nodes[node_id] = new_node
-            logger.info(f"Auto-registered node: {node_id} from {request.remote_addr}")
-        
-    if global_model is None:
-        initialize_global_model()
+    global coordinator
+    if coordinator is None:
+        return jsonify({"error": "Coordinator not initialized"}), 500
     
-    # Serialize the model
-    model_data = serialize_model(global_model)
-    
-    # Record that this node has the latest model
-    with lock:
-        nodes[node_id]["has_latest_model"] = True
-        nodes[node_id]["model_version"] = training_round
-    
-    # Create a temporary file to send
-    temp_file = os.path.join(config.TEMP_DIR, f"temp_model_{node_id}.pt")
-    torch.save(global_model.state_dict(), temp_file)
-    
-    try:
-        response = send_file(
-            temp_file,
-            mimetype='application/octet-stream',
-            as_attachment=True,
-            download_name=f"global_model_round_{training_round}.pt"
-        )
-        
-        # Schedule the temp file for deletion
-        @response.call_on_close
-        def remove_temp_file():
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        
-        return response
-    except Exception as e:
-        logger.error(f"Error sending model file: {e}")
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-        return jsonify({"error": f"Failed to send model: {str(e)}"}), 500
+    success = coordinator.update_node_heartbeat(node_id, system_info)
+    if success:
+        return jsonify({"status": "ok"}), 200
+    else:
+        return jsonify({"error": "Heartbeat update failed"}), 400
 
-@app.route('/api/submit_update', methods=['POST'])
-def submit_model_update():
-    """Receive a model update from a node."""
-    node_id = request.form.get("node_id")
+@app.route("/update_model", methods=["POST"])
+def update_model():
+    data = request.json
+    node_id = data.get("node_id")
+    model_state = data.get("model_state")
     
-    if not node_id:
-        return jsonify({"error": "Missing node ID"}), 400
+    if not all([node_id, model_state]):
+        return jsonify({"error": "Missing required fields"}), 400
     
-    with lock:
-        if node_id not in nodes:
-            logger.warning(f"Update from unknown node ID: {node_id}, auto-registering...")
-            # Auto-register if node_id not found
-            new_node = {
-                "id": node_id,
-                "ip": request.remote_addr,
-                "last_heartbeat": time.time(),
-                "system_info": {},
-                "status": "auto-registered-from-update"
-            }
-            nodes[node_id] = new_node
-            logger.info(f"Auto-registered node during update: {node_id} from {request.remote_addr}")
+    global coordinator
+    if coordinator is None:
+        return jsonify({"error": "Coordinator not initialized"}), 500
     
-    # Get the model file
-    if 'model' not in request.files:
-        return jsonify({"error": "No model file provided"}), 400
-        
-    model_file = request.files['model']
-    
-    # Save the model temporarily
-    temp_path = os.path.join(config.TEMP_DIR, f"temp_update_{node_id}.pt")
-    model_file.save(temp_path)
-    
-    # Load the model parameters
-    try:
-        state_dict = torch.load(temp_path)
-        
-        with lock:
-            # Store the model update
-            node_models[node_id] = state_dict
-            nodes[node_id]["last_update"] = time.time()
-            nodes[node_id]["update_round"] = training_round
-            
-            logger.info(f"Received model update from node {node_id} for round {training_round}")
-            
-        # Remove temporary file
-        os.remove(temp_path)
-        
-        # Check if we should aggregate models
-        should_aggregate = check_if_should_aggregate()
-        
-        return jsonify({
-            "message": "Model update received successfully",
-            "aggregation_triggered": should_aggregate
-        })
-        
-    except Exception as e:
-        logger.error(f"Error processing model update: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return jsonify({"error": f"Failed to process model update: {str(e)}"}), 500
+    success = coordinator.update_node_model(node_id, model_state)
+    if success:
+        # Try to aggregate models
+        coordinator.aggregate_models()
+        return jsonify({"status": "ok"}), 200
+    else:
+        return jsonify({"error": "Model update failed"}), 400
 
-@app.route('/api/status', methods=['GET'])
-def get_status():
-    """Get the status of the coordinator and connected nodes."""
-    return jsonify(get_coordinator_status())
+@app.route("/get_model", methods=["GET"])
+def get_model():
+    global coordinator
+    if coordinator is None:
+        return jsonify({"error": "Coordinator not initialized"}), 500
+    
+    if coordinator.global_model is None:
+        return jsonify({"error": "Global model not initialized"}), 500
+    
+    model_state = coordinator.global_model.state_dict()
+    return jsonify({"model_state": model_state}), 200
 
 def get_coordinator_status():
     """Get the current status of the coordination system."""
@@ -249,6 +208,7 @@ def get_coordinator_status():
         "cpu_nodes": cpu_nodes,
         "updates_received": len(node_models),
         "min_nodes_to_start": config.MIN_NODES_TO_START,
+        "current_model": current_model_name,
         "nodes": nodes  # Include the full nodes dictionary
     }
 
@@ -264,12 +224,14 @@ def check_if_should_aggregate():
     with lock:
         updates_for_current_round = sum(1 for node_id, node in nodes.items() 
                                       if node_id in node_models and 
+                                         node_models[node_id]["model_name"] == current_model_name and
                                          node_models.get("update_round", -1) == training_round)
         
         # Count active nodes
         current_time = time.time()
         active_nodes = sum(1 for node in nodes.values() 
-                          if current_time - node["last_heartbeat"] < config.NODE_TIMEOUT)
+                          if current_time - node["last_heartbeat"] < config.NODE_TIMEOUT and
+                             node["model_name"] == current_model_name)
     
     # If we have updates from all active nodes (or at least 75% of them and it's been a while)
     if (updates_for_current_round >= active_nodes or 
@@ -294,8 +256,16 @@ def aggregate_models():
         logger.info(f"Starting model aggregation for round {training_round}")
         
         try:
-            # Get the list of model state dictionaries
-            model_states = list(node_models.values())
+            # Get the list of model state dictionaries for current model
+            model_states = [
+                node_models[node_id]["state_dict"]
+                for node_id in node_models
+                if node_models[node_id]["model_name"] == current_model_name
+            ]
+            
+            if not model_states:
+                logger.warning("No model states to aggregate")
+                return
             
             # Perform federated averaging
             averaged_state = federated_averaging(model_states)
@@ -363,6 +333,8 @@ def parse_args():
                         help=f"Host to bind to (default: {config.COORDINATOR_HOST})")
     parser.add_argument("--port", type=int, default=config.COORDINATOR_PORT,
                         help=f"Port to listen on (default: {config.COORDINATOR_PORT})")
+    parser.add_argument("--model", type=str, default="t5-small",
+                        help="Model name to use (default: t5-small)")
     parser.add_argument("--debug", action="store_true",
                         help="Run in debug mode")
     return parser.parse_args()
@@ -370,8 +342,11 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     
+    # Set current model name
+    current_model_name = args.model
+    
     # Initialize the global model
-    initialize_global_model()
+    coordinator = Coordinator(current_model_name)
     
     # Start maintenance tasks
     start_maintenance_tasks()

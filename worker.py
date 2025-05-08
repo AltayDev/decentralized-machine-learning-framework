@@ -11,17 +11,21 @@ from typing import Dict, List, Any, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Dataset
 import requests
 from tqdm import tqdm
+from transformers import get_linear_schedule_with_warmup
+import numpy as np
+from PIL import Image
 
-from model import get_model, train_batch, test
+from model_registry import model_registry
 from utils import (
     setup_device, 
     get_detailed_system_info, 
-    send_heartbeat
+    send_heartbeat,
+    get_system_info,
+    serialize_model,
+    deserialize_model
 )
 import config
 
@@ -36,20 +40,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class TextDataset(Dataset):
+    """Dataset for text-to-text tasks."""
+    
+    def __init__(self, texts: List[str], targets: List[str], tokenizer, max_length: int):
+        self.texts = texts
+        self.targets = targets
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        target = self.targets[idx]
+        
+        # Tokenize inputs using encode method
+        input_ids = self.tokenizer.encode(text, max_length=self.max_length)
+        target_ids = self.tokenizer.encode(target, max_length=self.max_length)
+        
+        # Create attention mask (1 for real tokens, 0 for padding)
+        attention_mask = torch.ones_like(input_ids)
+        
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': target_ids
+        }
+
+class ImageDataset(Dataset):
+    def __init__(self, image_dir: str, transform=None):
+        self.image_dir = image_dir
+        self.transform = transform
+        self.image_files = [f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+        
+    def __len__(self):
+        return len(self.image_files)
+    
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.image_dir, self.image_files[idx])
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image
+
 class Worker:
     """Worker node for decentralized model training."""
     
     def __init__(
         self,
         coordinator_url: str,
+        model_name: str = "t5-small",
         use_gpu: bool = None,
         data_dir: str = config.DATA_DIR
     ):
         self.coordinator_url = coordinator_url
+        self.model_name = model_name
         self.node_id = None
         self.device = setup_device() if use_gpu is None else torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
         self.model = None
+        self.tokenizer = None
         self.optimizer = None
+        self.scheduler = None
         self.data_dir = data_dir
         self.train_loader = None
         self.test_loader = None
@@ -62,12 +115,15 @@ class Worker:
         # Register with coordinator
         self._register()
         
+        # Load model and tokenizer
+        self._load_model()
+        
         # Load data
         self._load_data()
         
         # Start heartbeat thread
         self._start_heartbeat()
-        
+    
     def _register(self):
         """Register with the coordinator."""
         try:
@@ -106,82 +162,193 @@ class Worker:
             
             raise
     
+    def _load_model(self):
+        """Load model and tokenizer from registry."""
+        try:
+            logger.info(f"Loading model {self.model_name} from registry")
+            self.model = model_registry.get_model(self.model_name)
+            self.tokenizer = model_registry.get_tokenizer(self.model_name)
+            self.model = self.model.to(self.device)
+            
+            # Create optimizer
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=config.LEARNING_RATE
+            )
+            
+            # Create scheduler
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=100,
+                num_training_steps=1000
+            )
+            
+            logger.info(f"Model and tokenizer loaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            raise
+    
     def _load_data(self):
         """Load the training and testing data."""
-        logger.info("Loading MNIST dataset...")
+        logger.info("Loading text dataset...")
         
-        # Define transforms
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
+        # TODO: Replace with actual text dataset loading
+        # This is a placeholder for demonstration
+        train_texts = ["Sample text 1", "Sample text 2"]
+        train_targets = ["Target 1", "Target 2"]
+        test_texts = ["Test text 1"]
+        test_targets = ["Test target 1"]
         
-        # Download and load training data
-        train_dataset = datasets.MNIST(
-            self.data_dir, train=True, download=True,
-            transform=transform
+        # Create datasets
+        train_dataset = TextDataset(
+            train_texts,
+            train_targets,
+            self.tokenizer,
+            model_registry.get_config(self.model_name)["max_length"]
         )
         
-        # Download and load test data
-        test_dataset = datasets.MNIST(
-            self.data_dir, train=False,
-            transform=transform
+        test_dataset = TextDataset(
+            test_texts,
+            test_targets,
+            self.tokenizer,
+            model_registry.get_config(self.model_name)["max_length"]
         )
         
         # Create data loaders
         self.train_loader = DataLoader(
-            train_dataset, 
-            batch_size=config.BATCH_SIZE, 
+            train_dataset,
+            batch_size=config.BATCH_SIZE,
             shuffle=True,
             num_workers=config.CPU_WORKERS
         )
         
         self.test_loader = DataLoader(
-            test_dataset, 
-            batch_size=config.TEST_BATCH_SIZE, 
+            test_dataset,
+            batch_size=config.TEST_BATCH_SIZE,
             shuffle=False,
             num_workers=config.CPU_WORKERS
         )
         
         logger.info("Data loading complete")
     
-    def _start_heartbeat(self):
-        """Start the heartbeat thread."""
-        def send_heartbeats():
-            heartbeat_failures = 0
-            max_failures = 3
-            
-            while self.is_running:
-                try:
-                    system_info = get_detailed_system_info()
-                    success = send_heartbeat(self.coordinator_url, self.node_id, system_info)
-                    
-                    if success:
-                        heartbeat_failures = 0
-                        logger.debug(f"Heartbeat sent successfully to {self.coordinator_url}")
-                    else:
-                        heartbeat_failures += 1
-                        logger.warning(f"Failed to send heartbeat. Failures: {heartbeat_failures}/{max_failures}")
-                        
-                        if heartbeat_failures >= max_failures:
-                            logger.error(f"Max heartbeat failures reached. Trying to re-register...")
-                            try:
-                                self._register()
-                                heartbeat_failures = 0
-                                logger.info("Re-registered successfully")
-                            except Exception as e:
-                                logger.error(f"Re-registration failed: {e}")
-                    
-                except Exception as e:
-                    heartbeat_failures += 1
-                    logger.error(f"Heartbeat error: {e}. Failures: {heartbeat_failures}/{max_failures}")
-                
-                time.sleep(config.NODE_HEARTBEAT_INTERVAL)
+    def train_batch(self, batch):
+        """Train on a single batch."""
+        self.model.train()
         
-        self.is_running = True
-        self.heartbeat_thread = threading.Thread(target=send_heartbeats, daemon=True)
-        self.heartbeat_thread.start()
-        logger.info("Heartbeat thread started")
+        # Move batch to device
+        input_ids = batch['input_ids'].to(self.device)
+        attention_mask = batch['attention_mask'].to(self.device)
+        labels = batch['labels'].to(self.device)
+        
+        # Forward pass
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+        
+        loss = outputs.loss
+        
+        # Backward pass
+        loss.backward()
+        self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+        
+        return {
+            "loss": loss.item(),
+            "accuracy": 0.0  # TODO: Implement accuracy calculation
+        }
+    
+    def test(self):
+        """Test the model."""
+        self.model.eval()
+        total_loss = 0
+        total_samples = 0
+        
+        with torch.no_grad():
+            for batch in self.test_loader:
+                # Move batch to device
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                # Forward pass
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                
+                loss = outputs.loss
+                total_loss += loss.item() * len(input_ids)
+                total_samples += len(input_ids)
+        
+        return {
+            "test_loss": total_loss / total_samples if total_samples > 0 else 0,
+            "test_accuracy": 0.0  # TODO: Implement accuracy calculation
+        }
+    
+    def train_local(self) -> Dict[str, float]:
+        """Train the model locally for a number of epochs."""
+        if self.model is None:
+            if not self._get_global_model():
+                return {"error": "Failed to get global model"}
+        
+        logger.info(f"Starting local training for {config.LOCAL_EPOCHS} epochs...")
+        metrics = {
+            "train_loss": 0,
+            "train_accuracy": 0,
+            "test_loss": 0,
+            "test_accuracy": 0
+        }
+        
+        for epoch in range(config.LOCAL_EPOCHS):
+            # Training phase
+            total_loss = 0
+            total_accuracy = 0
+            batch_count = 0
+            
+            with tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{config.LOCAL_EPOCHS}") as progress_bar:
+                for batch_idx, batch in enumerate(progress_bar):
+                    # Train on batch
+                    result = self.train_batch(batch)
+                    
+                    # Update metrics
+                    total_loss += result["loss"]
+                    total_accuracy += result["accuracy"]
+                    batch_count += 1
+                    
+                    # Update progress bar
+                    progress_bar.set_postfix({
+                        'loss': result["loss"],
+                        'accuracy': f"{result['accuracy']:.2f}%"
+                    })
+                    
+                    # Log every LOG_INTERVAL batches
+                    if batch_idx % config.LOG_INTERVAL == 0:
+                        logger.info(f"Train Epoch: {epoch+1} [{batch_idx*len(batch['input_ids'])}/{len(self.train_loader.dataset)} "
+                                   f"({100. * batch_idx / len(self.train_loader):.0f}%)]\t"
+                                   f"Loss: {result['loss']:.6f}, Accuracy: {result['accuracy']:.2f}%")
+            
+            # Calculate average metrics for the epoch
+            metrics["train_loss"] = total_loss / batch_count if batch_count > 0 else 0
+            metrics["train_accuracy"] = total_accuracy / batch_count if batch_count > 0 else 0
+            
+            logger.info(f"Epoch {epoch+1} complete: "
+                       f"Avg Loss: {metrics['train_loss']:.6f}, "
+                       f"Avg Accuracy: {metrics['train_accuracy']:.2f}%")
+        
+        # Test the model
+        test_results = self.test()
+        metrics.update(test_results)
+        
+        logger.info(f"Testing complete: "
+                   f"Loss: {test_results['test_loss']:.6f}, "
+                   f"Accuracy: {test_results['test_accuracy']:.2f}%")
+        
+        return metrics
     
     def _get_global_model(self) -> bool:
         """Fetch the global model from the coordinator."""
@@ -207,7 +374,7 @@ class Worker:
             
             # Load the model
             if self.model is None:
-                self.model = get_model()
+                self.model = model_registry.get_model(self.model_name)
                 
                 # For SimpleCNN, initialize with a dummy input to set up FC layers
                 if hasattr(self.model, 'is_initialized') and not self.model.is_initialized:
@@ -222,10 +389,16 @@ class Worker:
             self.model = self.model.to(self.device)
             
             # Create optimizer
-            self.optimizer = optim.SGD(
+            self.optimizer = optim.AdamW(
                 self.model.parameters(),
-                lr=config.LEARNING_RATE,
-                momentum=config.MOMENTUM
+                lr=config.LEARNING_RATE
+            )
+            
+            # Create scheduler
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=100,
+                num_training_steps=1000
             )
             
             # Get training round from coordinator status
@@ -280,67 +453,6 @@ class Worker:
             logger.error(f"Error submitting model update: {e}")
             return False
     
-    def train_local(self) -> Dict[str, float]:
-        """Train the model locally for a number of epochs."""
-        if self.model is None:
-            if not self._get_global_model():
-                return {"error": "Failed to get global model"}
-        
-        logger.info(f"Starting local training for {config.LOCAL_EPOCHS} epochs...")
-        metrics = {
-            "train_loss": 0,
-            "train_accuracy": 0,
-            "test_loss": 0,
-            "test_accuracy": 0
-        }
-        
-        for epoch in range(config.LOCAL_EPOCHS):
-            # Training phase
-            total_loss = 0
-            total_accuracy = 0
-            batch_count = 0
-            
-            self.model.train()
-            with tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{config.LOCAL_EPOCHS}") as progress_bar:
-                for batch_idx, (data, target) in enumerate(progress_bar):
-                    # Train on batch
-                    result = train_batch(self.model, data, target, self.optimizer, self.device)
-                    
-                    # Update metrics
-                    total_loss += result["loss"]
-                    total_accuracy += result["accuracy"]
-                    batch_count += 1
-                    
-                    # Update progress bar
-                    progress_bar.set_postfix({
-                        'loss': result["loss"],
-                        'accuracy': f"{result['accuracy']:.2f}%"
-                    })
-                    
-                    # Log every LOG_INTERVAL batches
-                    if batch_idx % config.LOG_INTERVAL == 0:
-                        logger.info(f"Train Epoch: {epoch+1} [{batch_idx*len(data)}/{len(self.train_loader.dataset)} "
-                                   f"({100. * batch_idx / len(self.train_loader):.0f}%)]\t"
-                                   f"Loss: {result['loss']:.6f}, Accuracy: {result['accuracy']:.2f}%")
-            
-            # Calculate average metrics for the epoch
-            metrics["train_loss"] = total_loss / batch_count if batch_count > 0 else 0
-            metrics["train_accuracy"] = total_accuracy / batch_count if batch_count > 0 else 0
-            
-            logger.info(f"Epoch {epoch+1} complete: "
-                       f"Avg Loss: {metrics['train_loss']:.6f}, "
-                       f"Avg Accuracy: {metrics['train_accuracy']:.2f}%")
-        
-        # Test the model
-        test_results = test(self.model, self.test_loader, self.device)
-        metrics.update(test_results)
-        
-        logger.info(f"Testing complete: "
-                   f"Loss: {test_results['test_loss']:.6f}, "
-                   f"Accuracy: {test_results['test_accuracy']:.2f}%")
-        
-        return metrics
-    
     def run_training_loop(self):
         """Run the continuous training loop."""
         logger.info("Starting training loop")
@@ -381,12 +493,34 @@ class Worker:
         if self.heartbeat_thread:
             self.heartbeat_thread.join(timeout=1)
         logger.info("Worker stopped")
+    
+    def _start_heartbeat(self):
+        """Start sending heartbeat signals to coordinator."""
+        def heartbeat_worker():
+            while self.is_running:
+                try:
+                    send_heartbeat(
+                        self.coordinator_url,
+                        self.node_id,
+                        get_detailed_system_info(),
+                        self.model_name
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending heartbeat: {e}")
+                time.sleep(config.NODE_HEARTBEAT_INTERVAL)
+        
+        self.is_running = True
+        self.heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
+        self.heartbeat_thread.start()
+        logger.info("Heartbeat thread started")
 
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Decentralized ML Worker Node")
     parser.add_argument("--coordinator-address", type=str, required=True,
                         help="Coordinator address in the format <host>:<port>")
+    parser.add_argument("--model", type=str, default="t5-small",
+                        help="Model name to use (default: t5-small)")
     parser.add_argument("--gpu", action="store_true",
                         help="Force using GPU if available")
     parser.add_argument("--cpu", action="store_true",
@@ -411,6 +545,7 @@ if __name__ == "__main__":
     # Create worker
     worker = Worker(
         coordinator_url=coordinator_url,
+        model_name=args.model,
         use_gpu=use_gpu,
         data_dir=args.data_dir
     )

@@ -5,7 +5,11 @@ import logging
 import torch
 import requests
 import numpy as np
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
+import io
+import psutil
+import base64
+import platform
 
 # Configure logging
 logging.basicConfig(
@@ -15,113 +19,132 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def setup_device() -> torch.device:
-    """Set up and return the appropriate device (CPU/GPU)."""
+    """Set up the device for training."""
     if torch.cuda.is_available():
         device = torch.device("cuda")
         logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
     else:
         device = torch.device("cpu")
-        logger.info("GPU not available, using CPU")
+        logger.info("Using CPU")
     return device
 
 def get_system_info() -> Dict[str, Any]:
-    """Get system information including CPU/GPU resources."""
-    info = {
-        "hostname": os.uname().nodename if hasattr(os, 'uname') else os.environ.get('COMPUTERNAME', 'unknown'),
-        "timestamp": time.time(),
-        "cpu_count": os.cpu_count(),
-        "gpu_available": torch.cuda.is_available(),
-        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+    """Get system information for the node."""
+    return {
+        "cpu_count": psutil.cpu_count(),
+        "memory_total": psutil.virtual_memory().total,
+        "memory_available": psutil.virtual_memory().available,
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0
     }
-    
-    if info["gpu_available"]:
-        info["gpu_info"] = []
-        for i in range(info["gpu_count"]):
-            info["gpu_info"].append({
-                "name": torch.cuda.get_device_name(i),
-                "memory_total": torch.cuda.get_device_properties(i).total_memory,
-                "memory_free": torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i),
-            })
-    
-    return info
-
-def serialize_model(model: torch.nn.Module) -> bytes:
-    """Serialize a PyTorch model to bytes."""
-    # Ensure model is initialized before serialization
-    if hasattr(model, 'is_initialized') and not model.is_initialized:
-        # Create a dummy input to initialize the model
-        dummy_input = torch.zeros(1, 1, 28, 28)  # MNIST image size
-        with torch.no_grad():
-            model(dummy_input)  # This will initialize the model
-    
-    buffer = io.BytesIO()
-    torch.save(model.state_dict(), buffer)
-    return buffer.getvalue()
-
-def deserialize_model(model: torch.nn.Module, serialized_model: bytes) -> torch.nn.Module:
-    """Deserialize bytes to update a PyTorch model."""
-    # Ensure model is initialized before deserialization
-    if hasattr(model, 'is_initialized') and not model.is_initialized:
-        # Create a dummy input to initialize the model
-        dummy_input = torch.zeros(1, 1, 28, 28)  # MNIST image size
-        with torch.no_grad():
-            model(dummy_input)  # This will initialize the model
-    
-    buffer = io.BytesIO(serialized_model)
-    state_dict = torch.load(buffer)
-    model.load_state_dict(state_dict)
-    return model
-
-def federated_averaging(models: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """
-    Perform federated averaging on a list of model parameters.
-    
-    Args:
-        models: List of model state dictionaries
-        
-    Returns:
-        Averaged model state dictionary
-    """
-    if not models:
-        raise ValueError("No models provided for averaging")
-        
-    # Initialize with the first model
-    avg_model = {}
-    for key in models[0].keys():
-        avg_model[key] = models[0][key].clone()
-    
-    # Add all models
-    for i in range(1, len(models)):
-        for key in avg_model.keys():
-            avg_model[key] += models[i][key]
-    
-    # Divide by number of models
-    for key in avg_model.keys():
-        avg_model[key] = avg_model[key] / len(models)
-        
-    return avg_model
-
-def send_heartbeat(coordinator_url: str, node_id: str, system_info: Dict[str, Any]) -> bool:
-    """Send heartbeat to coordinator with system information."""
-    try:
-        response = requests.post(
-            f"{coordinator_url}/api/heartbeat",
-            json={"node_id": node_id, "system_info": system_info}
-        )
-        return response.status_code == 200
-    except Exception as e:
-        logger.error(f"Failed to send heartbeat: {e}")
-        return False
-
-import io
-import psutil
 
 def get_detailed_system_info() -> Dict[str, Any]:
     """Get detailed system information."""
-    info = get_system_info()
+    info = {
+        "cpu_count": psutil.cpu_count(),
+        "cpu_percent": psutil.cpu_percent(interval=1),
+        "memory_total": psutil.virtual_memory().total,
+        "memory_available": psutil.virtual_memory().available,
+        "memory_percent": psutil.virtual_memory().percent,
+        "gpu_available": torch.cuda.is_available(),
+    }
     
-    # Add CPU usage information
-    info["cpu_percent"] = psutil.cpu_percent(interval=1)
-    info["memory_percent"] = psutil.virtual_memory().percent
+    if info["gpu_available"]:
+        info.update({
+            "gpu_name": torch.cuda.get_device_name(0),
+            "gpu_memory_total": torch.cuda.get_device_properties(0).total_memory,
+            "gpu_memory_allocated": torch.cuda.memory_allocated(0),
+            "gpu_memory_cached": torch.cuda.memory_reserved(0)
+        })
     
-    return info 
+    return info
+
+def send_heartbeat(coordinator_address: str, node_id: str, model_name: str) -> bool:
+    """Send heartbeat signal to coordinator."""
+    try:
+        response = requests.post(
+            f"http://{coordinator_address}/heartbeat",
+            json={
+                "node_id": node_id,
+                "system_info": get_system_info(),
+                "model_name": model_name
+            }
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Error sending heartbeat: {str(e)}")
+        return False
+
+def serialize_model(state_dict: Dict[str, torch.Tensor]) -> str:
+    """Serialize model state dict to base64 string."""
+    buffer = io.BytesIO()
+    torch.save(state_dict, buffer)
+    buffer.seek(0)
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+def deserialize_model(serialized_state: str) -> Dict[str, torch.Tensor]:
+    """Deserialize base64 string to model state dict."""
+    buffer = io.BytesIO(base64.b64decode(serialized_state))
+    return torch.load(buffer)
+
+def federated_averaging(model_states: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Perform federated averaging on model states."""
+    if not model_states:
+        raise ValueError("No model states provided for averaging")
+    
+    # Initialize averaged state with zeros
+    averaged_state = {}
+    for key in model_states[0].keys():
+        averaged_state[key] = torch.zeros_like(model_states[0][key])
+    
+    # Sum up all states
+    for state in model_states:
+        for key in averaged_state.keys():
+            averaged_state[key] += state[key]
+    
+    # Divide by number of models
+    for key in averaged_state.keys():
+        averaged_state[key] /= len(model_states)
+    
+    return averaged_state
+
+def calculate_metrics(predictions: List[str], targets: List[str]) -> Dict[str, float]:
+    """Calculate metrics for text generation."""
+    from nltk.translate.bleu_score import sentence_bleu
+    from nltk.tokenize import word_tokenize
+    import nltk
+    
+    # Download required NLTK data
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt')
+    
+    # Calculate BLEU score
+    bleu_scores = []
+    for pred, target in zip(predictions, targets):
+        pred_tokens = word_tokenize(pred.lower())
+        target_tokens = word_tokenize(target.lower())
+        bleu_scores.append(sentence_bleu([target_tokens], pred_tokens))
+    
+    avg_bleu = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0
+    
+    return {
+        "bleu_score": avg_bleu
+    }
+
+def save_training_history(history: Dict[str, List[float]], filepath: str):
+    """Save training history to a JSON file."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, 'w') as f:
+        json.dump(history, f)
+
+def load_training_history(filepath: str) -> Dict[str, List[float]]:
+    """Load training history from a JSON file."""
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            return json.load(f)
+    return {} 
